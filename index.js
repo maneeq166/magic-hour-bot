@@ -7,6 +7,7 @@ const MagicHourImport = require("magic-hour");
 const MagicHour = MagicHourImport.default || MagicHourImport; 
 
 // Initialize Magic Hour API client
+// IMPORTANT: Assumes MH_API_KEY is correct in .env
 const mh = new MagicHour({ token: process.env.MH_API_KEY });
 
 // Initialize Discord Client
@@ -22,77 +23,57 @@ const discord = new Client({
 const BOT_COMMAND_PREFIX = "create meme";
 
 discord.once("ready", () => {
-  console.log(`✅ Logged in as ${discord.user.tag}`);
+  console.log(` Logged in as ${discord.user.tag}`);
   // Set the bot's activity status
   discord.user.setActivity(`Use @${discord.user.username} ${BOT_COMMAND_PREFIX}`);
 });
 
 /**
- * Generates a meme using the Magic Hour AI Meme Generator.
- * Polls the job status until it's complete or fails.
- * @param {string} prompt - The creative prompt for the meme.
- * @returns {Promise<string|null>} The URL of the generated meme, or null on failure.
+ * Generates an image using the simplified Magic Hour .generate() function (aiImageGenerator).
+ * This function internally handles the create and poll steps.
+ * @param {string} prompt - The creative prompt for the image.
+ * @returns {Promise<string|null>} The URL of the generated image, or null on failure.
  */
 async function generateMeme(prompt) {
   const startTime = Date.now();
-  console.log(`[${new Date().toLocaleTimeString()}] ➡️ Attempting to create Magic Hour job for prompt: "${prompt.substring(0, 30)}..."`);
+  console.log(`[${new Date().toLocaleTimeString()}] ➡️ Attempting to generate image for prompt: "${prompt.substring(0, 30)}..."`);
   
   try {
-    // 💡 FIX: Including 'prompt' inside the style object for maximum compatibility
-    const job = await mh.v1.aiMemeGenerator.create({
-      prompt, // Retain the top-level prompt just in case
-      name: "Discord Meme",
-      style: {
-          prompt: prompt, // <-- NEW: Added prompt inside style object
-          aspectRatio: "16:9",
-          mood: "humorous",
-          model: "gemini-2.5-flash-meme",
+    // Using the aiImageGenerator as requested
+    const result = await mh.v1.aiImageGenerator.generate(
+      {
+        // Parameters for the generation job
+        name: "Discord Image Generation", // Required for aiImageGenerator
+        imageCount: 1, 
+        orientation:"landscape",
+        style: {
+            prompt: prompt, 
+        }
+      },
+      {
+        // Options for the SDK wrapper function
+        waitForCompletion: true, 
+        downloadOutputs: false, // We only need the URL
       }
-    });
+    );
     
-    console.log(`[${new Date().toLocaleTimeString()}] ✅ Job created successfully. ID: ${job.id}. Starting 3-second polling loop.`);
-
-
-    let status = job.status;
-    let attempts = 0;
-    const maxAttempts = 20; // 60 seconds total wait time
-
-    while (status !== "complete" && status !== "error" && attempts < maxAttempts) {
-      attempts++;
-      
-      // 💡 Polling for job status
-      const current = await mh.v1.aiMemeGenerator.get({ id: job.id });
-      status = current.status;
-      
-      const elapsedSeconds = Math.round((Date.now() - startTime) / 1000);
-      console.log(`[${new Date().toLocaleTimeString()}] 🔄 [Attempt ${attempts} / ${maxAttempts}] Polling ID ${job.id}. Status: **${status}**. Elapsed: ${elapsedSeconds}s`);
-
-
-      if (status === "complete" && current.downloads.length > 0) {
+    // Check if the generation was successful and has outputs
+    if (result.status === "complete" && result.downloads && result.downloads.length > 0) {
         const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
-        console.log(`[${new Date().toLocaleTimeString()}] 🎉 Meme job ${job.id} completed! Total time: ${totalTime}s.`);
-        return current.downloads[0].url;
-      }
-      
-      await new Promise((r) => setTimeout(r, 3000)); // Wait 3 seconds
-    }
-    
-    // Log final status if it was not complete
-    if (status === "error") {
-        console.error(`[${new Date().toLocaleTimeString()}] ❌ Job ${job.id} failed. API reported error status.`);
-        // Optional: console.error("API Response Details:", current); // Uncomment if you want full error object
-    } else if (attempts >= maxAttempts) {
-        console.error(`[${new Date().toLocaleTimeString()}] ❌ Job ${job.id} timed out after 60 seconds.`);
+        console.log(`[${new Date().toLocaleTimeString()}] 🎉 Job ${result.id} completed! Total time: ${totalTime}s.`);
+        return result.downloads[0].url;
     } else {
-        console.error(`[${new Date().toLocaleTimeString()}] ❌ Job ${job.id} failed with unexpected status: ${status}.`);
+        // Log detailed error from the API side if status is 'error'
+        const errorDetails = result.error ? result.error.message : 'No detailed error provided.';
+        console.error(`[${new Date().toLocaleTimeString()}] ❌ Job failed. Final Status: ${result.status}. Error: ${errorDetails}`);
+        return null;
     }
-
-    return null;
 
   } catch (err) {
-    // This catches errors during the initial 'create' call (e.g., bad API key, Zod error, network error)
-    console.error(`[${new Date().toLocaleTimeString()}] 🛑 FATAL ERROR DURING JOB CREATION.`);
-    console.error("❌ Full Error Object:", err);
+    // Catches network errors or immediate API key/quota rejections
+    console.error(`[${new Date().toLocaleTimeString()}] 🛑 FATAL ERROR DURING IMAGE GENERATION. Check API key/Quota.`);
+    // Log the actual exception/message from the SDK
+    console.error("❌ Full Error Object/Message:", err.message || err);
     return null;
   }
 }
@@ -145,8 +126,16 @@ discord.on("messageCreate", async (message) => {
 
   // Check if the bot was mentioned
   if (message.mentions.has(discord.user)) {
-    // Remove the mention part from the message content
-    const content = message.content.replace(/<@!?(\d+)>/, "").trim();
+    // FIX: Get the clean content string and safely remove the first word (the resolved mention).
+    let contentArray = message.cleanContent.trim().split(/\s+/);
+
+    // Safely shift the first element (the mention itself, e.g., "@MagicHourAI")
+    if (contentArray.length > 0 && contentArray[0].startsWith('@')) {
+        contentArray.shift(); 
+    }
+    
+    // Rejoin the remaining words to get the clean command/prompt string
+    const content = contentArray.join(' ').trim();
 
     // Check for the specific command: "create meme <prompt>"
     if (content.toLowerCase().startsWith(BOT_COMMAND_PREFIX)) {
@@ -156,20 +145,25 @@ discord.on("messageCreate", async (message) => {
         return message.reply(`Please provide a meme idea after the command, like: \`@${discord.user.username} ${BOT_COMMAND_PREFIX} when the database finally compiles\``);
       }
 
+      // 1. Send immediate reply to confirm receipt
       await message.reply("🎨 Generating your meme... hang tight!");
       console.log(`🤖 Generating user-requested meme for: ${prompt}`);
 
       const memeUrl = await generateMeme(prompt);
 
       if (memeUrl) {
-        // Tag the user and send the generated meme
+        // 2. Send the result
         await message.reply({ 
-            content: `😂 Hey ${message.author}! Here’s the meme you requested based on: **${prompt}**`, 
+            content: `😂 Hey ${message.author}! Here’s the image you requested based on: **${prompt}**`, 
             files: [memeUrl] 
         });
       } else {
-        await message.reply("❌ Failed to generate meme. The prompt might be too complex or the service timed out.");
+        // 3. Send failure notice
+        await message.reply("❌ **Image generation failed.** This could be due to an invalid API Key/Quota, or the prompt was rejected by the AI.");
       }
+    } else {
+        // Log if the command was missed due to incorrect prefix (e.g., "create me a meme")
+        console.log(`[${new Date().toLocaleTimeString()}] ⚠️ Message content did not match prefix: "${content.substring(0, 50)}"`);
     }
   }
 });
@@ -178,11 +172,11 @@ discord.on("messageCreate", async (message) => {
 // --- 2. AUTOMATIC CONTENT EVERY 2 HOURS ---
 // Cron expression: "0 */2 * * *" means "At minute 0 of every 2nd hour."
 cron.schedule("0 */2 * * *", async () => {
-  console.log(`[${new Date().toLocaleTimeString()}] 🕰️ Running 2-hour auto-meme generation task...`);
+  console.log(`[${new Date().toLocaleTimeString()}] 🕰️ Running 2-hour auto-image generation task...`);
   try {
     const channelId = process.env.CHANNEL_ID;
     if (!channelId) {
-        return console.error("❌ CHANNEL_ID is not defined in .env, skipping auto-meme.");
+        return console.error("❌ CHANNEL_ID is not defined in .env, skipping auto-image generation.");
     }
     
     const channel = await discord.channels.fetch(channelId);
@@ -195,32 +189,32 @@ cron.schedule("0 */2 * * *", async () => {
         const messageContent = engagingMessage.content;
         
         // Construct a contextual prompt for the AI based on the engaging chat
-        const memePrompt = `Create a humorous image/meme based on this recent server chat: "${messageContent}". Tag the user ${author.username}.`;
+        const imagePrompt = `Create a humorous image based on this recent server chat: "${messageContent}". Tag the user ${author.username}.`;
 
-        console.log(`[${new Date().toLocaleTimeString()}] 🔥 Found engaging message by ${author.username}. Generating auto-meme...`);
+        console.log(`[${new Date().toLocaleTimeString()}] 🔥 Found engaging message by ${author.username}. Generating auto-image...`);
         
-        const memeUrl = await generateMeme(memePrompt);
+        const memeUrl = await generateMeme(imagePrompt);
 
         if (memeUrl) {
-          // Send the meme, tagging the original author
+          // Send the image, tagging the original author
           await channel.send({ 
-              content: `🤣 **Auto Meme Time!** This one's for you, ${author}! (Based on your recent engaging chat: *${messageContent.substring(0, 50)}...*)`, 
+              content: `🤣 **Auto Image Time!** This one's for you, ${author}! (Based on your recent engaging chat: *${messageContent.substring(0, 50)}...*)`, 
               files: [memeUrl] 
           });
-          console.log(`[${new Date().toLocaleTimeString()}] ✅ Auto-meme posted in channel ${channel.name}.`);
+          console.log(`[${new Date().toLocaleTimeString()}] ✅ Auto-image posted in channel ${channel.name}.`);
         } else {
-            console.error("❌ Failed to generate auto-meme.");
+            console.error("❌ Failed to generate auto-image.");
         }
     } else {
         console.log("ℹ️ Could not find an engaging non-bot message in the last 50.");
         // Fallback: Post a generic server joke if no message context is found
         const memeUrl = await generateMeme("something funny for a discord server that is full of coders and gamers");
         if (memeUrl) {
-             await channel.send({ content: "😂 Auto meme time! Here's a generic joke for the server.", files: [memeUrl] });
+             await channel.send({ content: "😂 Auto Image Time! Here's a generic joke for the server.", files: [memeUrl] });
         }
     }
   } catch (err) {
-    console.error("❌ Auto meme error:", err);
+    console.error("❌ Auto image error:", err);
   }
 });
 
