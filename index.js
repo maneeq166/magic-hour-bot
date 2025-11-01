@@ -1,16 +1,15 @@
 require("dotenv").config();
-const { Client, GatewayIntentBits } = require("discord.js");
+const { Client, GatewayIntentBits, PermissionsBitField, REST, Routes } = require("discord.js");
 const cron = require("node-cron");
 const MagicHourImport = require("magic-hour");
 
-// Resolve the MagicHour constructor, checking for the common .default export when using require()
-const MagicHour = MagicHourImport.default || MagicHourImport; 
+// Handle CommonJS default export
+const MagicHour = MagicHourImport.default || MagicHourImport;
 
-// Initialize Magic Hour API client
-// IMPORTANT: Assumes MH_API_KEY is correct in .env
+// Initialize Magic Hour client
 const mh = new MagicHour({ token: process.env.MH_API_KEY });
 
-// Initialize Discord Client
+// Create Discord client
 const discord = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -21,251 +20,185 @@ const discord = new Client({
 });
 
 const BOT_COMMAND_PREFIX = "create meme";
+const CHANNEL_SETUP_COMMAND = "setmemechannel";
 
+// === Store multiple channels per guild ===
+const guildChannelMap = new Map(); // guildId -> [channelIds]
+
+// === ON READY ===
 discord.once("ready", () => {
   console.log(`✅ Logged in as ${discord.user.tag}`);
-  // Set the bot's activity status
-  discord.user.setActivity(
-    `Use @${discord.user.username} ${BOT_COMMAND_PREFIX}`
-  );
+  discord.user.setActivity(`Use /${CHANNEL_SETUP_COMMAND} to set meme channels`);
 });
 
-/**
- * Generates content (meme/image) using the Magic Hour AI Meme Generator.
- * @param {string} prompt - The creative prompt for the content.
- * @returns {Promise<string|null>} The URL of the generated content, or null on failure.
- */
-async function generateContent(prompt) {
-  const startTime = Date.now();
-  console.log(
-    `[${new Date().toLocaleTimeString()}] ➡️ Attempting to generate content for prompt: "${prompt.substring(
-      0,
-      30
-    )}..."`
-  );
+// === REGISTER SLASH COMMANDS ===
+const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
+
+async function registerCommands(clientId) {
+  const commands = [
+    {
+      name: CHANNEL_SETUP_COMMAND,
+      description: "Add a channel where memes should be posted automatically",
+      options: [
+        {
+          name: "channel",
+          description: "Select the channel for meme posting",
+          type: 7, // CHANNEL type
+          required: true,
+        },
+      ],
+    },
+  ];
 
   try {
-    // Using the aiMemeGenerator as requested, with 'topic' and 'template'
+    console.log("⚙️ Registering slash commands...");
+    await rest.put(Routes.applicationCommands(clientId), { body: commands });
+    console.log("✅ Slash commands registered globally.");
+  } catch (error) {
+    console.error("❌ Failed to register commands:", error);
+  }
+}
+
+// === HANDLE SLASH COMMANDS ===
+discord.on("interactionCreate", async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  if (interaction.commandName === CHANNEL_SETUP_COMMAND) {
+    if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+      return interaction.reply({ content: "❌ Only admins can set meme channels.", ephemeral: true });
+    }
+
+    const channel = interaction.options.getChannel("channel");
+
+    // Store multiple channels for each guild
+    const channels = guildChannelMap.get(interaction.guildId) || [];
+    if (!channels.includes(channel.id)) {
+      channels.push(channel.id);
+      guildChannelMap.set(interaction.guildId, channels);
+    }
+
+    await interaction.reply(`✅ Added ${channel.toString()} for auto memes! You can add more channels too.`);
+  }
+});
+
+// === FUNCTION: Generate Meme via Magic Hour ===
+async function generateContent(prompt) {
+  try {
+    console.log(`[${new Date().toLocaleTimeString()}] 🎨 Generating meme for: "${prompt}"`);
+
     const result = await mh.v1.aiMemeGenerator.generate(
       {
-        // Parameters for the generation job
         name: "Discord Meme Generation",
         style: {
           searchWeb: false,
-          template: "Random", // Uses a random meme template format
-          topic: prompt, // The prompt is passed as the topic/idea
+          template: "Random",
+          topic: prompt,
         },
       },
-      {
-        // Options for the SDK wrapper function
-        waitForCompletion: true,
-        downloadOutputs: false, // We only need the URL
-      }
+      { waitForCompletion: true, downloadOutputs: false }
     );
 
-    // Check if the generation was successful and has outputs
-    if (
-      result.status === "complete" &&
-      result.downloads &&
-      result.downloads.length > 0
-    ) {
-      const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
-      console.log(
-        `[${new Date().toLocaleTimeString()}] 🎉 Job ${
-          result.id
-        } completed! Total time: ${totalTime}s.`
-      );
+    if (result.status === "complete" && result.downloads?.length > 0) {
       return result.downloads[0].url;
     } else {
-      // Log detailed error from the API side if status is 'error'
-      const errorDetails = result.error
-        ? result.error.message
-        : "No detailed error provided.";
-      console.error(
-        `[${new Date().toLocaleTimeString()}] ❌ Job failed. Final Status: ${
-          result.status
-        }. Error: ${errorDetails}`
-      );
+      console.error("❌ Meme generation failed:", result.error?.message);
       return null;
     }
   } catch (err) {
-    // Catches network errors or immediate API key/quota rejections
-    console.error(
-      `[${new Date().toLocaleTimeString()}] 🛑 FATAL ERROR DURING CONTENT GENERATION. Check API key/Quota.`
-    );
-    // Log the actual exception/message from the SDK
-    console.error("❌ Full Error Object/Message:", err.message || err);
+    console.error("🛑 MagicHour error:", err.message);
     return null;
   }
 }
 
-/**
- * Finds the most engaging message in the last 50, based on total reaction count.
- * @param {Channel} channel - The Discord channel object.
- * @returns {Promise<Message|null>} The most engaging message, or null.
- */
+// === FUNCTION: Find Most Engaging Message ===
 async function findMostEngagingMessage(channel) {
   try {
-    // Fetch the last 50 messages
     const messages = await channel.messages.fetch({ limit: 50 });
     let mostEngaging = null;
     let maxReactions = -1;
 
     for (const message of messages.values()) {
-      // Ignore bot messages
       if (message.author.bot) continue;
-
       let totalReactions = 0;
-      // Sum up the counts of all unique reactions on the message
-      message.reactions.cache.forEach((reaction) => {
-        totalReactions += reaction.count;
-      });
+      message.reactions.cache.forEach((reaction) => (totalReactions += reaction.count));
 
-      // If this message has more reactions than the current max, it's the new favorite
       if (totalReactions > maxReactions) {
         maxReactions = totalReactions;
         mostEngaging = message;
       }
     }
 
-    // Fallback: If no messages had reactions, just return the most recent non-bot message
-    if (!mostEngaging && messages.size > 0) {
-      return messages.find((m) => !m.author.bot) || null;
-    }
-
+    if (!mostEngaging) mostEngaging = messages.find((m) => !m.author.bot) || null;
     return mostEngaging;
   } catch (error) {
-    console.error("❌ Error fetching messages for engaging content:", error);
+    console.error("❌ Error finding engaging message:", error);
     return null;
   }
 }
 
-// --- 1. RESPOND TO USER PROMPTS ---
+// === RESPOND TO @MENTIONS ===
 discord.on("messageCreate", async (message) => {
   if (message.author.bot) return;
+  if (!message.mentions.has(discord.user)) return;
 
-  // Check if the bot was mentioned
-  if (message.mentions.has(discord.user)) {
-    // FIX: Get the clean content string and safely remove the first word (the resolved mention).
-    let contentArray = message.cleanContent.trim().split(/\s+/);
+  const contentArray = message.cleanContent.trim().split(/\s+/);
+  if (contentArray[0].startsWith("@")) contentArray.shift();
+  const content = contentArray.join(" ").trim();
 
-    // Safely shift the first element (the mention itself, e.g., "@MagicHourAI")
-    if (contentArray.length > 0 && contentArray[0].startsWith("@")) {
-      contentArray.shift();
+  if (content.toLowerCase().startsWith(BOT_COMMAND_PREFIX)) {
+    const prompt = content.substring(BOT_COMMAND_PREFIX.length).trim();
+
+    if (!prompt) {
+      return message.reply(`Please provide a meme idea like: \`@${discord.user.username} create meme when it’s finally Friday\``);
     }
 
-    // Rejoin the remaining words to get the clean command/prompt string
-    const content = contentArray.join(" ").trim();
+    await message.reply("🎨 Generating your meme... hang tight!");
+    const memeUrl = await generateContent(prompt);
 
-    // Check for the specific command: "create meme <prompt>"
-    if (content.toLowerCase().startsWith(BOT_COMMAND_PREFIX)) {
-      const prompt = content.substring(BOT_COMMAND_PREFIX.length).trim();
-
-      if (!prompt) {
-        return message.reply(
-          `Please provide a meme idea after the command, like: \`@${discord.user.username} ${BOT_COMMAND_PREFIX} when the database finally compiles\``
-        );
-      }
-
-      // 1. Send immediate reply to confirm receipt
-      await message.reply("🎨 Generating your meme... hang tight!");
-      console.log(`🤖 Generating user-requested meme for: ${prompt}`);
-
-      const memeUrl = await generateContent(prompt);
-
-      if (memeUrl) {
-        // 2. Send the result
-        await message.reply({
-          content: `😂 Hey ${message.author}! Here’s the content you requested based on: **${prompt}**`,
-          files: [memeUrl],
-        });
-      } else {
-        // 3. Send failure notice
-        await message.reply(
-          "❌ **Content generation failed.** This could be due to an invalid API Key/Quota, or the prompt was rejected by the AI."
-        );
-      }
+    if (memeUrl) {
+      await message.reply({
+        content: `😂 Here's your meme, ${message.author}: **${prompt}**`,
+        files: [memeUrl],
+      });
     } else {
-        // Log if the command was missed due to incorrect prefix (e.g., "create me a meme")
-        console.log(
-          `[${new Date().toLocaleTimeString()}] ⚠️ Message content did not match prefix: "${content.substring(
-            0,
-            50
-          )}..."`
-        );
+      await message.reply("❌ Meme generation failed. Check MagicHour API or try another prompt.");
     }
   }
 });
 
-// --- 2. AUTOMATIC CONTENT EVERY 2 HOURS (PRODUCTION) ---
-// Cron expression: "0 */2 * * *" means "At minute 0 of every 2nd hour."
+// === AUTOMATIC MEME EVERY 1 MINUTE ===
 cron.schedule("0 */2 * * *", async () => {
-  console.log(
-    `[${new Date().toLocaleTimeString()}] 🕰️ Running 2-hour auto-content task...`
-  );
-  try {
-    const channelId = process.env.CHANNEL_ID;
-    if (!channelId) {
-      return console.error(
-        "❌ CHANNEL_ID is not defined in .env, skipping auto-content generation."
-      );
-    }
+  console.log(`[${new Date().toLocaleTimeString()}] 🕒 Auto meme job running...`);
 
-    const channel = await discord.channels.fetch(channelId);
+  for (const [guildId, channelIds] of guildChannelMap.entries()) {
+    for (const channelId of channelIds) {
+      try {
+        const channel = await discord.channels.fetch(channelId);
+        const engagingMessage = await findMostEngagingMessage(channel);
 
-    // 1. Identify the funniest or most engaging chat
-    const engagingMessage = await findMostEngagingMessage(channel);
+        if (engagingMessage) {
+          const author = engagingMessage.author;
+          const content = engagingMessage.content;
+          const prompt = `Create a funny meme based on this message: "${content}"`;
 
-    if (engagingMessage) {
-      const author = engagingMessage.author;
-      const messageContent = engagingMessage.content;
+          console.log(`🔥 Generating auto meme for ${author.username} in guild ${guildId}, channel ${channel.name}`);
+          const memeUrl = await generateContent(prompt);
 
-      // Construct a contextual prompt for the AI based on the engaging chat
-      const contentPrompt = `Create a humorous meme based on this recent server chat: "${messageContent}".`;
-
-      console.log(
-        `[${new Date().toLocaleTimeString()}] 🔥 Found engaging message by ${
-          author.username
-        }. Generating auto-content...`
-      );
-
-      const memeUrl = await generateContent(contentPrompt);
-
-      if (memeUrl) {
-        // Send the content, tagging the original author
-        await channel.send({
-          content: `🤣 **Auto Content Time!** This one's for you, ${author}! (Based on your engaging chat: *${messageContent.substring(
-            0,
-            50
-          )}...*)`,
-          files: [memeUrl],
-        });
-        console.log(
-          `[${new Date().toLocaleTimeString()}] ✅ Auto-content posted in channel ${
-            channel.name
-          }.`
-        );
-      } else {
-        console.error("❌ Failed to generate auto-content.");
-      }
-    } else {
-      console.log(
-        "ℹ️ Could not find an engaging non-bot message in the last 50."
-      );
-      // Fallback: Post a generic server joke if no message context is found
-      const memeUrl = await generateContent(
-        "something funny for a discord server that is full of coders and gamers"
-      );
-      if (memeUrl) {
-        await channel.send({
-          content: "😂 Auto Content Time! Here's a generic joke for the server.",
-          files: [memeUrl],
-        });
+          if (memeUrl) {
+            await channel.send({
+              content: `🤣 **Auto Meme Time!** This one’s for you, ${author}! (Based on: "${content.substring(0, 50)}...")`,
+              files: [memeUrl],
+            });
+          }
+        }
+      } catch (err) {
+        console.error("❌ Error in auto meme job:", err);
       }
     }
-  } catch (err) {
-    console.error("❌ Auto content error:", err);
   }
 });
 
-discord.login(process.env.DISCORD_TOKEN);
+// === START BOT ===
+discord.login(process.env.DISCORD_TOKEN).then(() => {
+  registerCommands(discord.user?.id || process.env.CLIENT_ID);
+});
