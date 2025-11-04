@@ -1,94 +1,51 @@
 require("dotenv").config();
-const { Client, GatewayIntentBits, PermissionsBitField, REST, Routes } = require("discord.js");
+const { App, ExpressReceiver } = require("@slack/bolt");
 const cron = require("node-cron");
+const express = require("express");
 const MagicHourImport = require("magic-hour");
 
-// Handle CommonJS default export
+// === Initialize Magic Hour SDK ===
 const MagicHour = MagicHourImport.default || MagicHourImport;
-
-// Initialize Magic Hour client
 const mh = new MagicHour({ token: process.env.MH_API_KEY });
 
-// Create Discord client
-const discord = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMessageReactions,
-  ],
+// === EXPRESS RECEIVER FOR SLACK EVENTS ===
+const receiver = new ExpressReceiver({
+  signingSecret: process.env.SLACK_SIGNING_SECRET,
 });
 
-const BOT_COMMAND_PREFIX = "create meme";
-const CHANNEL_SETUP_COMMAND = "setmemechannel";
+// === EXPRESS SERVER REFERENCE ===
+const server = receiver.app;
 
-// === Store multiple channels per guild ===
-const guildChannelMap = new Map(); // guildId -> [channelIds]
-
-// === ON READY ===
-discord.once("ready", () => {
-  console.log(`✅ Logged in as ${discord.user.tag}`);
-  discord.user.setActivity(`Use /${CHANNEL_SETUP_COMMAND} to set meme channels`);
+// === SLACK APP INITIALIZATION ===
+const app = new App({
+  token: process.env.SLACK_BOT_TOKEN,
+  receiver,
 });
 
-// === REGISTER SLASH COMMANDS ===
-const rest = new REST({ version: "10" }).setToken(process.env.DISCORD_TOKEN);
+// === TEMPORARY IN-MEMORY CHANNEL STORE ===
+const channelMap = new Map(); // teamId -> [channelIds]
 
-async function registerCommands(clientId) {
-  const commands = [
-    {
-      name: CHANNEL_SETUP_COMMAND,
-      description: "Add a channel where memes should be posted automatically",
-      options: [
-        {
-          name: "channel",
-          description: "Select the channel for meme posting",
-          type: 7, // CHANNEL type
-          required: true,
-        },
-      ],
-    },
-  ];
+// === HEALTH CHECK ENDPOINT ===
+server.get("/", (req, res) => {
+  res.send("✅ Magic Hour Slack Bot is up and running!");
+});
+
+// === LOG EVERY SLACK EVENT FOR DEBUGGING ===
+app.event(/.*/, async ({ event }) => {
+  console.log(`📩 [EVENT] Type: ${event.type}`);
+  if (event.text) console.log(`🗣️  Message Text: "${event.text}"`);
+  if (event.user) console.log(`👤 From User: ${event.user}`);
+  if (event.channel) console.log(`💬 In Channel: ${event.channel}`);
+});
+
+// === HELPER: Generate Meme Using Magic Hour SDK ===
+async function generateMeme(prompt) {
+  console.log(`🎨 [Magic Hour] Generating meme for prompt: "${prompt}"`);
 
   try {
-    console.log("⚙️ Registering slash commands...");
-    await rest.put(Routes.applicationCommands(clientId), { body: commands });
-    console.log("✅ Slash commands registered globally.");
-  } catch (error) {
-    console.error("❌ Failed to register commands:", error);
-  }
-}
-
-// === HANDLE SLASH COMMANDS ===
-discord.on("interactionCreate", async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-
-  if (interaction.commandName === CHANNEL_SETUP_COMMAND) {
-    if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-      return interaction.reply({ content: "❌ Only admins can set meme channels.", ephemeral: true });
-    }
-
-    const channel = interaction.options.getChannel("channel");
-
-    // Store multiple channels for each guild
-    const channels = guildChannelMap.get(interaction.guildId) || [];
-    if (!channels.includes(channel.id)) {
-      channels.push(channel.id);
-      guildChannelMap.set(interaction.guildId, channels);
-    }
-
-    await interaction.reply(`✅ Added ${channel.toString()} for auto memes! You can add more channels too.`);
-  }
-});
-
-// === FUNCTION: Generate Meme via Magic Hour ===
-async function generateContent(prompt) {
-  try {
-    console.log(`[${new Date().toLocaleTimeString()}] 🎨 Generating meme for: "${prompt}"`);
-
     const result = await mh.v1.aiMemeGenerator.generate(
       {
-        name: "Discord Meme Generation",
+        name: "Slack Meme Generation",
         style: {
           searchWeb: false,
           template: "Random",
@@ -98,107 +55,153 @@ async function generateContent(prompt) {
       { waitForCompletion: true, downloadOutputs: false }
     );
 
-    if (result.status === "complete" && result.downloads?.length > 0) {
-      return result.downloads[0].url;
-    } else {
-      console.error("❌ Meme generation failed:", result.error?.message);
-      return null;
-    }
+    console.log("🧩 [Magic Hour] Full SDK Response:", JSON.stringify(result, null, 2));
+
+    const memeUrl =
+      result?.downloads?.[0]?.url ||
+      result?.downloadedPaths?.[0] ||
+      null;
+
+    if (!memeUrl) throw new Error("No meme URL returned from Magic Hour SDK");
+    console.log(`✅ [Magic Hour] Meme generated successfully: ${memeUrl}`);
+    return memeUrl;
   } catch (err) {
-    console.error("🛑 MagicHour error:", err.message);
+    console.error("❌ [Magic Hour] SDK Error generating meme:", err.message);
     return null;
   }
 }
 
-// === FUNCTION: Find Most Engaging Message ===
-async function findMostEngagingMessage(channel) {
-  try {
-    const messages = await channel.messages.fetch({ limit: 50 });
-    let mostEngaging = null;
-    let maxReactions = -1;
+// === HELPER: Find Most Engaging Message ===
+async function findEngagingMessage(messages) {
+  console.log("🔍 [Find Engaging] Evaluating recent messages...");
+  let top = null;
+  let maxScore = 0;
 
-    for (const message of messages.values()) {
-      if (message.author.bot) continue;
-      let totalReactions = 0;
-      message.reactions.cache.forEach((reaction) => (totalReactions += reaction.count));
+  for (const msg of messages) {
+    const reactionScore = msg.reactions?.reduce((s, r) => s + (r.count || 0), 0) || 0;
+    const lengthScore = (msg.text?.length || 0) / 10;
+    const score = reactionScore + lengthScore;
 
-      if (totalReactions > maxReactions) {
-        maxReactions = totalReactions;
-        mostEngaging = message;
-      }
+    console.log(`💬 Message: "${msg.text?.substring(0, 50)}..." | Score: ${score}`);
+
+    if (score > maxScore) {
+      maxScore = score;
+      top = msg;
     }
-
-    if (!mostEngaging) mostEngaging = messages.find((m) => !m.author.bot) || null;
-    return mostEngaging;
-  } catch (error) {
-    console.error("❌ Error finding engaging message:", error);
-    return null;
   }
+
+  console.log(top ? `🏆 [Find Engaging] Selected: "${top.text}"` : "⚠️ No engaging message found.");
+  return top;
 }
 
-// === RESPOND TO @MENTIONS ===
-discord.on("messageCreate", async (message) => {
-  if (message.author.bot) return;
-  if (!message.mentions.has(discord.user)) return;
+// === COMMAND: setchannel ===
+app.message(/^setchannel/i, async ({ message, say }) => {
+  console.log(`⚙️ [Command] 'setchannel' called in team ${message.team}, channel ${message.channel}`);
 
-  const contentArray = message.cleanContent.trim().split(/\s+/);
-  if (contentArray[0].startsWith("@")) contentArray.shift();
-  const content = contentArray.join(" ").trim();
+  const teamId = message.team;
+  const existing = channelMap.get(teamId) || [];
 
-  if (content.toLowerCase().startsWith(BOT_COMMAND_PREFIX)) {
-    const prompt = content.substring(BOT_COMMAND_PREFIX.length).trim();
+  if (!existing.includes(message.channel)) existing.push(message.channel);
+  channelMap.set(teamId, existing);
 
-    if (!prompt) {
-      return message.reply(`Please provide a meme idea like: \`@${discord.user.username} create meme when it’s finally Friday\``);
-    }
+  await say(`✅ This channel (<#${message.channel}>) is now set for Magic Hour auto memes.`);
+  console.log(`📌 [Channel Added] ${message.channel} saved for team ${teamId}`);
+});
 
-    await message.reply("🎨 Generating your meme... hang tight!");
-    const memeUrl = await generateContent(prompt);
+// === LISTEN FOR "@Magic hour create meme ..." ===
+app.event("app_mention", async ({ event, say }) => {
+  console.log(`🚀 [Mention Detected] Text: "${event.text}" from ${event.user}`);
 
-    if (memeUrl) {
-      await message.reply({
-        content: `😂 Here's your meme, ${message.author}: **${prompt}**`,
-        files: [memeUrl],
-      });
-    } else {
-      await message.reply("❌ Meme generation failed. Check MagicHour API or try another prompt.");
-    }
+  const text = event.text || "";
+  if (!text.toLowerCase().includes("create meme")) {
+    console.log("⚠️ [Mention Ignored] No 'create meme' keyword found.");
+    return;
+  }
+
+  const userPrompt = text.replace(/<@.*?>/g, "").replace(/create meme/i, "").trim();
+  if (!userPrompt) {
+    console.log("⚠️ [Mention Invalid] Empty meme prompt.");
+    await say("❌ Please provide a meme idea, e.g. `@Magic hour create meme when code finally works`");
+    return;
+  }
+
+  await say(`🎨 Generating your meme, <@${event.user}>...`);
+  const memeUrl = await generateMeme(userPrompt);
+
+  if (memeUrl) {
+    await app.client.chat.postMessage({
+      channel: event.channel, // ✅ FIXED HERE
+      text: `😂 Here's your meme, <@${event.user}>!`,
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: `😂 Here's your meme, <@${event.user}>!`,
+          },
+        },
+        {
+          type: "image",
+          image_url: memeUrl,
+          alt_text: "generated meme",
+        },
+      ],
+    });
+    console.log(`✅ [Manual Meme] Sent meme to ${event.user}`);
+  } else {
+    await say("❌ Sorry, couldn't generate meme. Try again later.");
+    console.error(`❌ [Manual Meme] Failed for user ${event.user}`);
   }
 });
 
-// === AUTOMATIC MEME EVERY 1 MINUTE ===
+
+// === CRON JOB: AUTO MEMES EVERY 2 HOURS ===
+// For testing: use "*/1 * * * *" (every 1 minute)
 cron.schedule("0 */2 * * *", async () => {
-  console.log(`[${new Date().toLocaleTimeString()}] 🕒 Auto meme job running...`);
+  console.log(`🕒 [CRON] Running auto meme job at ${new Date().toLocaleTimeString()}`);
 
-  for (const [guildId, channelIds] of guildChannelMap.entries()) {
-    for (const channelId of channelIds) {
+  for (const [team, channels] of channelMap.entries()) {
+    for (const channel of channels) {
       try {
-        const channel = await discord.channels.fetch(channelId);
-        const engagingMessage = await findMostEngagingMessage(channel);
+        console.log(`📡 [CRON] Fetching messages for team: ${team}, channel: ${channel}`);
+        const result = await app.client.conversations.history({
+          token: process.env.SLACK_BOT_TOKEN,
+          channel,
+          limit: 50,
+        });
 
-        if (engagingMessage) {
-          const author = engagingMessage.author;
-          const content = engagingMessage.content;
-          const prompt = `Create a funny meme based on this message: "${content}"`;
+        const engaging = await findEngagingMessage(result.messages);
+        if (!engaging) {
+          console.log("⚠️ [CRON] No engaging message found.");
+          continue;
+        }
 
-          console.log(`🔥 Generating auto meme for ${author.username} in guild ${guildId}, channel ${channel.name}`);
-          const memeUrl = await generateContent(prompt);
+        const author = engaging.user;
+        const content = engaging.text;
+        console.log(`✨ [CRON] Selected message: "${content}" by user ${author}`);
 
-          if (memeUrl) {
-            await channel.send({
-              content: `🤣 **Auto Meme Time!** This one’s for you, ${author}! (Based on: "${content.substring(0, 50)}...")`,
-              files: [memeUrl],
-            });
-          }
+        const memeUrl = await generateMeme(`Make a funny meme based on: "${content}"`);
+
+        if (memeUrl) {
+          await app.client.chat.postMessage({
+            channel,
+            text: `🤣 Auto Meme Time! <@${author}> (Based on: "${content.substring(0, 50)}...")`,
+            attachments: [{ image_url: memeUrl, alt_text: "meme" }],
+          });
+          console.log(`✅ [CRON] Meme posted successfully in ${channel}`);
+        } else {
+          console.error(`❌ [CRON] Meme generation failed for channel ${channel}`);
         }
       } catch (err) {
-        console.error("❌ Error in auto meme job:", err);
+        console.error("❌ [CRON] Error in auto meme job:", err.message);
       }
     }
   }
 });
 
-// === START BOT ===
-discord.login(process.env.DISCORD_TOKEN).then(() => {
-  registerCommands(discord.user?.id || process.env.CLIENT_ID);
-});
+// === START SLACK APP ===
+(async () => {
+  await app.start(process.env.PORT || 3000);
+  console.log("⚡ Magic Hour Slack Bot is running on port " + (process.env.PORT || 3000));
+  console.log("✅ Express health check: http://localhost:" + (process.env.PORT || 3000));
+})();
