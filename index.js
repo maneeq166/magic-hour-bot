@@ -108,29 +108,44 @@ app.message(/^setchannel/i, async ({ message, say }) => {
   console.log(`📌 [Channel Added] ${message.channel} saved for team ${teamId}`);
 });
 
-// === LISTEN FOR "@Magic hour create meme ..." ===
+// === LISTEN FOR "@Magic hour ..." (no need to type 'create meme') ===
 app.event("app_mention", async ({ event, say }) => {
   console.log(`🚀 [Mention Detected] Text: "${event.text}" from ${event.user}`);
 
   const text = event.text || "";
-  if (!text.toLowerCase().includes("create meme")) {
-    console.log("⚠️ [Mention Ignored] No 'create meme' keyword found.");
-    return;
-  }
 
-  const userPrompt = text.replace(/<@.*?>/g, "").replace(/create meme/i, "").trim();
+  // Remove bot mention (like <@U12345>)
+  const userPrompt = text.replace(/<@.*?>/g, "").trim();
+
   if (!userPrompt) {
     console.log("⚠️ [Mention Invalid] Empty meme prompt.");
-    await say("❌ Please provide a meme idea, e.g. `@Magic hour create meme when code finally works`");
+    await say("❌ Please type something after tagging me, e.g. `@Magic hour when code finally works`");
     return;
   }
 
-  // await say(`🎨 Generating your meme, <@${event.user}>...`);
+  console.log(`🧠 [Prompt Extracted] "${userPrompt}"`);
+
+  // Send temporary "Generating..." message and store its timestamp (ts)
+  const generatingMsg = await app.client.chat.postMessage({
+    channel: event.channel,
+    text: `🎨 Generating your meme, <@${event.user}>...`,
+  });
+
+  const tempMsgTs = generatingMsg.ts;
+
+  // Generate meme
   const memeUrl = await generateMeme(userPrompt);
 
   if (memeUrl) {
+    // Delete the "Generating..." message
+    await app.client.chat.delete({
+      channel: event.channel,
+      ts: tempMsgTs,
+    });
+
+    // Post the final meme
     await app.client.chat.postMessage({
-      channel: event.channel, 
+      channel: event.channel,
       text: `😂 Here's your meme, <@${event.user}>!`,
       blocks: [
         {
@@ -147,12 +162,21 @@ app.event("app_mention", async ({ event, say }) => {
         },
       ],
     });
+
     console.log(`✅ [Manual Meme] Sent meme to ${event.user}`);
   } else {
-    await say("❌ Sorry, couldn't generate meme. Try again later.");
+    // Update the message instead of deleting, to show error
+    await app.client.chat.update({
+      channel: event.channel,
+      ts: tempMsgTs,
+      text: "❌ Sorry, couldn't generate meme. Try again later.",
+    });
+
     console.error(`❌ [Manual Meme] Failed for user ${event.user}`);
   }
 });
+
+
 
 
 // === CRON JOB: AUTO MEMES EVERY 2 HOURS ===
