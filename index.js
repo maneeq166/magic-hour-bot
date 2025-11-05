@@ -125,12 +125,12 @@ app.event("app_mention", async ({ event, say }) => {
     return;
   }
 
-  await say(`🎨 Generating your meme, <@${event.user}>...`);
+  // await say(`🎨 Generating your meme, <@${event.user}>...`);
   const memeUrl = await generateMeme(userPrompt);
 
   if (memeUrl) {
     await app.client.chat.postMessage({
-      channel: event.channel, // ✅ FIXED HERE
+      channel: event.channel, 
       text: `😂 Here's your meme, <@${event.user}>!`,
       blocks: [
         {
